@@ -927,3 +927,1046 @@ export function resolveAIRequestContext(
     };
 
 }
+/*
+|--------------------------------------------------------------------------
+| AI CONTROLLER
+|--------------------------------------------------------------------------
+| Part 2
+|
+| Responsibilities:
+|
+| - Resolve authenticated merchant/shop
+| - Resolve visitor
+| - Resolve conversation
+| - Validate subscription
+| - Verify resource ownership
+| - Prevent cross-shop conversation access
+| - Build secure AI request context
+|--------------------------------------------------------------------------
+*/
+
+import mongoose from "mongoose";
+
+import Shop from "../../models/shop.js";
+import Visitor from "../../models/Visitor.js";
+import Conversation from "../../models/Conversation.js";
+import Subscription from "../../models/Subscription.js";
+
+import AIService from "../../services/ai/ai.service.js";
+
+import logger from "../../config/logger.js";
+
+/*
+|--------------------------------------------------------------------------
+| Validate MongoDB ObjectId
+|--------------------------------------------------------------------------
+*/
+
+function isValidObjectId(id) {
+
+    return Boolean(
+
+        id &&
+
+        mongoose.Types.ObjectId.isValid(id)
+
+    );
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Get Request Shop ID
+|--------------------------------------------------------------------------
+|
+| Priority:
+|
+| 1. req.shop
+| 2. req.user.shop
+| 3. req.body.shopId
+| 4. req.params.shopId
+|
+| Never trust client-provided IDs when authenticated
+| context already provides a verified shop.
+|--------------------------------------------------------------------------
+*/
+
+function resolveShopId(req) {
+
+    if (req.shop?._id) {
+
+        return req.shop._id;
+
+    }
+
+    if (req.user?.shop?._id) {
+
+        return req.user.shop._id;
+
+    }
+
+    if (req.user?.shopId) {
+
+        return req.user.shopId;
+
+    }
+
+    if (req.body?.shopId) {
+
+        return req.body.shopId;
+
+    }
+
+    if (req.params?.shopId) {
+
+        return req.params.shopId;
+
+    }
+
+    return null;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Resolve Visitor ID
+|--------------------------------------------------------------------------
+*/
+
+function resolveVisitorId(req) {
+
+    return (
+
+        req.visitor?._id ||
+
+        req.body?.visitorId ||
+
+        req.body?.visitor?._id ||
+
+        req.params?.visitorId ||
+
+        null
+
+    );
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Resolve Conversation ID
+|--------------------------------------------------------------------------
+*/
+
+function resolveConversationId(req) {
+
+    return (
+
+        req.body?.conversationId ||
+
+        req.params?.conversationId ||
+
+        req.conversation?._id ||
+
+        null
+
+    );
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Load Shop
+|--------------------------------------------------------------------------
+*/
+
+export async function resolveShop(req) {
+
+    const shopId = resolveShopId(req);
+
+    if (!shopId) {
+
+        const error = new Error(
+
+            "Shop context is required."
+
+        );
+
+        error.statusCode = 400;
+
+        error.code = "SHOP_CONTEXT_REQUIRED";
+
+        throw error;
+
+    }
+
+    if (!isValidObjectId(shopId)) {
+
+        const error = new Error(
+
+            "Invalid shop ID."
+
+        );
+
+        error.statusCode = 400;
+
+        error.code = "INVALID_SHOP_ID";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | If authentication middleware already loaded the shop,
+    | use the verified document.
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        req.shop &&
+
+        String(req.shop._id) === String(shopId)
+
+    ) {
+
+        return req.shop;
+
+    }
+
+    const shop = await Shop.findById(
+
+        shopId
+
+    ).lean();
+
+    if (!shop) {
+
+        const error = new Error(
+
+            "Shop not found."
+
+        );
+
+        error.statusCode = 404;
+
+        error.code = "SHOP_NOT_FOUND";
+
+        throw error;
+
+    }
+
+    return shop;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Validate Shop Status
+|--------------------------------------------------------------------------
+*/
+
+export function validateShopStatus(shop) {
+
+    if (!shop) {
+
+        const error = new Error(
+
+            "Shop not found."
+
+        );
+
+        error.statusCode = 404;
+
+        error.code = "SHOP_NOT_FOUND";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Block deleted shops
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        shop.deleted === true ||
+
+        shop.isDeleted === true
+
+    ) {
+
+        const error = new Error(
+
+            "This store is no longer available."
+
+        );
+
+        error.statusCode = 403;
+
+        error.code = "SHOP_DELETED";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Block disabled shops
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        shop.status &&
+
+        ![
+
+            "active",
+
+            "trial",
+
+            "past_due"
+
+        ].includes(
+
+            String(shop.status).toLowerCase()
+
+        )
+
+    ) {
+
+        const error = new Error(
+
+            "This store is currently unavailable."
+
+        );
+
+        error.statusCode = 403;
+
+        error.code = "SHOP_INACTIVE";
+
+        throw error;
+
+    }
+
+    return true;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Load Subscription
+|--------------------------------------------------------------------------
+*/
+
+export async function resolveSubscription(
+
+    shop
+
+) {
+
+    if (!shop?._id) {
+
+        const error = new Error(
+
+            "Shop is required to resolve subscription."
+
+        );
+
+        error.statusCode = 400;
+
+        error.code = "SHOP_REQUIRED";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Use populated subscription if already available.
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        shop.subscription &&
+
+        typeof shop.subscription === "object" &&
+
+        shop.subscription._id
+
+    ) {
+
+        return shop.subscription;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Resolve subscription from shop reference.
+    |--------------------------------------------------------------------------
+    */
+
+    if (shop.subscription) {
+
+        const subscription =
+
+            await Subscription.findById(
+
+                shop.subscription
+
+            ).lean();
+
+        if (subscription) {
+
+            return subscription;
+
+        }
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Fallback:
+    | Find the current subscription belonging to this shop.
+    |--------------------------------------------------------------------------
+    |
+    | The exact subscription status field should match
+    | the finalized Subscription model.
+    |--------------------------------------------------------------------------
+    */
+
+    const subscription =
+
+        await Subscription.findOne({
+
+            shop: shop._id
+
+        })
+
+        .sort({
+
+            createdAt: -1
+
+        })
+
+        .lean();
+
+    if (!subscription) {
+
+        const error = new Error(
+
+            "Subscription not found."
+
+        );
+
+        error.statusCode = 402;
+
+        error.code = "SUBSCRIPTION_NOT_FOUND";
+
+        throw error;
+
+    }
+
+    return subscription;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Validate AI Subscription
+|--------------------------------------------------------------------------
+*/
+
+export function validateAISubscription(
+
+    subscription
+
+) {
+
+    /*
+    |--------------------------------------------------------------------------
+    | Use the finalized AIService subscription validation.
+    |--------------------------------------------------------------------------
+    */
+
+    AIService.validateSubscription(
+
+        subscription
+
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Additional trial expiration check.
+    |--------------------------------------------------------------------------
+    |
+    | This prevents an expired trial from continuing to
+    | access the AI service if isActive was not synchronized.
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        subscription.trialEndsAt &&
+
+        new Date(
+
+            subscription.trialEndsAt
+
+        ).getTime() < Date.now()
+
+    ) {
+
+        const error = new Error(
+
+            "Your free trial has expired."
+
+        );
+
+        error.statusCode = 402;
+
+        error.code = "TRIAL_EXPIRED";
+
+        throw error;
+
+    }
+
+    return true;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Resolve Visitor
+|--------------------------------------------------------------------------
+*/
+
+export async function resolveVisitor(
+
+    req,
+
+    shop
+
+) {
+
+    const visitorId = resolveVisitorId(req);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Visitor is optional for some internal AI endpoints.
+    |--------------------------------------------------------------------------
+    */
+
+    if (!visitorId) {
+
+        return null;
+
+    }
+
+    if (!isValidObjectId(visitorId)) {
+
+        const error = new Error(
+
+            "Invalid visitor ID."
+
+        );
+
+        error.statusCode = 400;
+
+        error.code = "INVALID_VISITOR_ID";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Use verified request visitor when available.
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        req.visitor &&
+
+        String(req.visitor._id) === String(visitorId)
+
+    ) {
+
+        return req.visitor;
+
+    }
+
+    const visitor =
+
+        await Visitor.findOne({
+
+            _id: visitorId,
+
+            shop: shop._id
+
+        })
+
+        .lean();
+
+    if (!visitor) {
+
+        const error = new Error(
+
+            "Visitor not found."
+
+        );
+
+        error.statusCode = 404;
+
+        error.code = "VISITOR_NOT_FOUND";
+
+        throw error;
+
+    }
+
+    return visitor;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Resolve Conversation
+|--------------------------------------------------------------------------
+*/
+
+export async function resolveConversation(
+
+    req,
+
+    shop,
+
+    visitor = null
+
+) {
+
+    const conversationId =
+
+        resolveConversationId(req);
+
+    /*
+    |--------------------------------------------------------------------------
+    | No conversation supplied.
+    |--------------------------------------------------------------------------
+    |
+    | The chat controller can create a new conversation
+    | in the next part.
+    |--------------------------------------------------------------------------
+    */
+
+    if (!conversationId) {
+
+        return null;
+
+    }
+
+    if (!isValidObjectId(conversationId)) {
+
+        const error = new Error(
+
+            "Invalid conversation ID."
+
+        );
+
+        error.statusCode = 400;
+
+        error.code = "INVALID_CONVERSATION_ID";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | IMPORTANT SECURITY RULE
+    |--------------------------------------------------------------------------
+    |
+    | Conversation must belong to the requested shop.
+    |--------------------------------------------------------------------------
+    */
+
+    const query = {
+
+        _id: conversationId,
+
+        shop: shop._id
+
+    };
+
+    /*
+    |--------------------------------------------------------------------------
+    | If visitor context exists, enforce visitor ownership.
+    |--------------------------------------------------------------------------
+    */
+
+    if (visitor?._id) {
+
+        query.visitor = visitor._id;
+
+    }
+
+    const conversation =
+
+        await Conversation.findOne(
+
+            query
+
+        )
+
+        .populate("shop")
+
+        .populate("visitor")
+
+        .populate("subscription");
+
+    if (!conversation) {
+
+        const error = new Error(
+
+            "Conversation not found or access denied."
+
+        );
+
+        error.statusCode = 404;
+
+        error.code = "CONVERSATION_NOT_FOUND";
+
+        throw error;
+
+    }
+
+    return conversation;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Validate Conversation Ownership
+|--------------------------------------------------------------------------
+*/
+
+export function validateConversationOwnership({
+
+    conversation,
+
+    shop,
+
+    visitor
+
+}) {
+
+    if (!conversation) {
+
+        return true;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Shop ownership
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        !conversation.shop ||
+
+        String(
+
+            conversation.shop._id ||
+
+            conversation.shop
+
+        ) !== String(shop._id)
+
+    ) {
+
+        const error = new Error(
+
+            "Conversation does not belong to this shop."
+
+        );
+
+        error.statusCode = 403;
+
+        error.code = "CONVERSATION_SHOP_MISMATCH";
+
+        throw error;
+
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Visitor ownership
+    |--------------------------------------------------------------------------
+    |
+    | Only enforce when visitor context is available.
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+
+        visitor &&
+
+        conversation.visitor &&
+
+        String(
+
+            conversation.visitor._id ||
+
+            conversation.visitor
+
+        ) !== String(visitor._id)
+
+    ) {
+
+        const error = new Error(
+
+            "Conversation does not belong to this visitor."
+
+        );
+
+        error.statusCode = 403;
+
+        error.code = "CONVERSATION_VISITOR_MISMATCH";
+
+        throw error;
+
+    }
+
+    return true;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Build AI Request Context
+|--------------------------------------------------------------------------
+|
+| This function centralizes all validated resources needed
+| by the chat controller.
+|--------------------------------------------------------------------------
+*/
+
+export async function buildAIRequestContext(
+
+    req
+
+) {
+
+    /*
+    |--------------------------------------------------------------------------
+    | 1. Resolve Shop
+    |--------------------------------------------------------------------------
+    */
+
+    const shop =
+
+        await resolveShop(req);
+
+    validateShopStatus(shop);
+
+    /*
+    |--------------------------------------------------------------------------
+    | 2. Resolve Subscription
+    |--------------------------------------------------------------------------
+    */
+
+    const subscription =
+
+        await resolveSubscription(shop);
+
+    validateAISubscription(
+
+        subscription
+
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | 3. Resolve Visitor
+    |--------------------------------------------------------------------------
+    */
+
+    const visitor =
+
+        await resolveVisitor(
+
+            req,
+
+            shop
+
+        );
+
+    /*
+    |--------------------------------------------------------------------------
+    | 4. Resolve Conversation
+    |--------------------------------------------------------------------------
+    */
+
+    const conversation =
+
+        await resolveConversation(
+
+            req,
+
+            shop,
+
+            visitor
+
+        );
+
+    /*
+    |--------------------------------------------------------------------------
+    | 5. Verify Ownership
+    |--------------------------------------------------------------------------
+    */
+
+    validateConversationOwnership({
+
+        conversation,
+
+        shop,
+
+        visitor
+
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Return secure context
+    |--------------------------------------------------------------------------
+    */
+
+    return {
+
+        shop,
+
+        subscription,
+
+        visitor,
+
+        conversation
+
+    };
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Check AI Token Availability
+|--------------------------------------------------------------------------
+*/
+
+export function checkAITokenAvailability({
+
+    subscription,
+
+    estimatedTokens = 0
+
+}) {
+
+    const availability =
+
+        AIService.checkTokenAvailability(
+
+            subscription,
+
+            estimatedTokens
+
+        );
+
+    if (!availability.allowed) {
+
+        const error = new Error(
+
+            "Monthly AI token limit has been reached."
+
+        );
+
+        error.statusCode = 429;
+
+        error.code = "AI_TOKEN_LIMIT_REACHED";
+
+        error.details = {
+
+            limit:
+
+                availability.limit,
+
+            used:
+
+                subscription.monthlyTokensUsed || 0,
+
+            remaining:
+
+                availability.remaining
+
+        };
+
+        throw error;
+
+    }
+
+    return availability;
+
+}
+
+/*
+|--------------------------------------------------------------------------
+| Log Resolved AI Context
+|--------------------------------------------------------------------------
+*/
+
+export function logAIContext({
+
+    shop,
+
+    subscription,
+
+    visitor,
+
+    conversation
+
+}) {
+
+    logger.info(
+
+        "AI request context resolved",
+
+        {
+
+            shopId:
+
+                shop?._id,
+
+            subscriptionId:
+
+                subscription?._id,
+
+            plan:
+
+                subscription?.plan,
+
+            visitorId:
+
+                visitor?._id || null,
+
+            conversationId:
+
+                conversation?._id || null
+
+        }
+
+    );
+
+}
