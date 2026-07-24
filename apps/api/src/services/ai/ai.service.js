@@ -4082,3 +4082,1274 @@ export function buildErrorResponse(
     };
 
 }
+/*
+|--------------------------------------------------------------------------
+| AI SERVICE — PART 4
+| Main Chat Orchestration
+| Streaming
+| Public APIs
+| Final Service Export
+|--------------------------------------------------------------------------
+*/
+
+/*
+|--------------------------------------------------------------------------
+| Main Chat Function
+|--------------------------------------------------------------------------
+|
+| Complete AI request pipeline:
+|
+| 1. Validate shop
+| 2. Validate subscription
+| 3. Analyze customer intent
+| 4. Build customer memory
+| 5. Generate recommendations
+| 6. Build system prompt
+| 7. Build conversation messages
+| 8. Check token availability
+| 9. Call OpenAI
+| 10. Calculate usage and cost
+| 11. Build product cards/actions/quick replies
+| 12. Save assistant message
+| 13. Update conversation
+| 14. Update analytics
+| 15. Update customer memory
+| 16. Return formatted response
+|--------------------------------------------------------------------------
+*/
+
+export async function chat({
+
+    shop,
+
+    visitor,
+
+    conversation,
+
+    message,
+
+    currentProduct = null,
+
+    cart = {},
+
+    currentPage = {},
+
+    stream = false
+
+}) {
+
+    const startedAt = Date.now();
+
+    try {
+
+        /*
+        |--------------------------------------------------------------------------
+        | Validate Required Data
+        |--------------------------------------------------------------------------
+        */
+
+        if (!shop) {
+
+            throw new Error(
+                "Shop is required for AI chat."
+            );
+
+        }
+
+        if (!conversation) {
+
+            throw new Error(
+                "Conversation is required for AI chat."
+            );
+
+        }
+
+        if (!message || !String(message).trim()) {
+
+            throw new Error(
+                "Message is required."
+            );
+
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Validate Subscription
+        |--------------------------------------------------------------------------
+        */
+
+        const subscription =
+            shop.subscription ||
+            conversation.subscription;
+
+        validateSubscription(
+            subscription
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Resolve Plan
+        |--------------------------------------------------------------------------
+        */
+
+        const plan =
+            subscription.plan || "Starter";
+
+        /*
+        |--------------------------------------------------------------------------
+        | Analyze Customer Intent
+        |--------------------------------------------------------------------------
+        */
+
+        const intent =
+            await analyzeCustomerIntent({
+
+                conversation,
+
+                message
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Build Customer Memory
+        |--------------------------------------------------------------------------
+        */
+
+        const memory =
+            await buildMemoryContext(
+
+                conversation
+
+            );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Generate Recommendations
+        |--------------------------------------------------------------------------
+        */
+
+        const recommendations =
+            await generateRecommendations({
+
+                conversation,
+
+                shop,
+
+                currentProduct,
+
+                cartItems:
+                    cart.items || []
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Load Product Catalog
+        |--------------------------------------------------------------------------
+        |
+        | The prompt should receive the actual active product catalog.
+        |--------------------------------------------------------------------------
+        */
+
+        const products =
+            await loadProducts(
+
+                shop._id
+
+            );
+
+        const productContext =
+            buildProductContext(
+
+                products
+
+            );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Build System Prompt
+        |--------------------------------------------------------------------------
+        */
+
+        const systemPrompt =
+            await buildPrompt({
+
+                plan,
+
+                merchant:
+                    shop.merchant || {},
+
+                shop,
+
+                customer:
+                    visitor || {},
+
+                conversation,
+
+                products:
+                    productContext,
+
+                currentPage,
+
+                cart
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Load Conversation History
+        |--------------------------------------------------------------------------
+        */
+
+        const history =
+            await loadConversationHistory(
+
+                conversation._id
+
+            );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Build OpenAI Messages
+        |--------------------------------------------------------------------------
+        */
+
+        const messages = [
+
+            {
+
+                role: "system",
+
+                content: systemPrompt
+
+            },
+
+            ...history.map(item => ({
+
+                role:
+                    item.role === "visitor"
+                        ? "user"
+                        : item.role,
+
+                content:
+                    item.content || ""
+
+            })),
+
+            {
+
+                role: "user",
+
+                content: String(message)
+
+            }
+
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | Estimate Request Tokens
+        |--------------------------------------------------------------------------
+        |
+        | The exact usage is returned by OpenAI.
+        | This pre-check prevents requests when the subscription
+        | token allowance has already been exhausted.
+        |--------------------------------------------------------------------------
+        */
+
+        const tokenLimit =
+            getTokenLimit(plan);
+
+        const estimatedTokens =
+            Math.min(
+
+                tokenLimit,
+
+                Math.ceil(
+
+                    JSON.stringify(
+                        messages
+                    ).length / 4
+
+                )
+
+            );
+
+        const tokenAvailability =
+            checkTokenAvailability(
+
+                subscription,
+
+                estimatedTokens
+
+            );
+
+        if (!tokenAvailability.allowed) {
+
+            throw new Error(
+
+                "Monthly AI token limit reached."
+
+            );
+
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Streaming Response
+        |--------------------------------------------------------------------------
+        */
+
+        if (stream) {
+
+            return streamChatResponse({
+
+                shop,
+
+                visitor,
+
+                conversation,
+
+                message,
+
+                plan,
+
+                messages,
+
+                intent,
+
+                memory,
+
+                recommendations,
+
+                startedAt
+
+            });
+
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Generate AI Response
+        |--------------------------------------------------------------------------
+        */
+
+        const completion =
+            await requestAI({
+
+                shop,
+
+                user: visitor,
+
+                messages,
+
+                temperature:
+                    AI_CONFIG.TEMPERATURE,
+
+                maxTokens:
+                    tokenLimit
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Calculate Performance Metrics
+        |--------------------------------------------------------------------------
+        */
+
+        const finishedAt =
+            Date.now();
+
+        const performance =
+            buildPerformanceMetrics({
+
+                startedAt,
+
+                finishedAt,
+
+                usage:
+                    completion.usage,
+
+                model:
+                    completion.model
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Build Response Data
+        |--------------------------------------------------------------------------
+        */
+
+        const productCards =
+            buildProductCards(
+
+                recommendations
+
+            );
+
+        const quickReplies =
+            buildQuickReplies(
+
+                intent.intent
+
+            );
+
+        const actions =
+            buildActions(
+
+                recommendations
+
+            );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Build AI Metadata
+        |--------------------------------------------------------------------------
+        */
+
+        const metadata = {
+
+            intent:
+
+                intent.intent || "unknown",
+
+            intentConfidence:
+
+                intent.confidence || 0,
+
+            sentiment:
+
+                intent.sentiment || "neutral",
+
+            customerStage:
+
+                intent.customerStage ||
+                "visitor",
+
+            model:
+
+                completion.model,
+
+            plan,
+
+            responseTime:
+
+                performance.responseTime
+
+        };
+
+        /*
+        |--------------------------------------------------------------------------
+        | Save Assistant Message
+        |--------------------------------------------------------------------------
+        */
+
+        const assistantMessage =
+            await saveAssistantMessage({
+
+                conversation,
+
+                shop,
+
+                visitor,
+
+                content:
+                    completion.content,
+
+                ai: {
+
+                    model:
+                        completion.model,
+
+                    provider:
+                        "openai",
+
+                    promptTokens:
+                        performance.promptTokens,
+
+                    completionTokens:
+                        performance.completionTokens,
+
+                    totalTokens:
+                        performance.totalTokens,
+
+                    inputCost:
+                        performance.inputCost,
+
+                    outputCost:
+                        performance.outputCost,
+
+                    totalCost:
+                        performance.totalCost,
+
+                    responseTime:
+                        performance.responseTime
+
+                },
+
+                recommendations:
+                    productCards,
+
+                actions,
+
+                quickReplies
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Update Conversation
+        |--------------------------------------------------------------------------
+        */
+
+        await updateConversationAfterResponse({
+
+            conversation,
+
+            assistantMessage,
+
+            aiUsage: {
+
+                promptTokens:
+                    performance.promptTokens,
+
+                completionTokens:
+                    performance.completionTokens,
+
+                totalTokens:
+                    performance.totalTokens,
+
+                estimatedCost:
+                    performance.totalCost,
+
+                responseTime:
+                    performance.responseTime
+
+            }
+
+        });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Update Analytics
+        |--------------------------------------------------------------------------
+        */
+
+        await updateConversationAnalytics({
+
+            conversation,
+
+            recommendations:
+                productCards
+
+        });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Update Customer Memory
+        |--------------------------------------------------------------------------
+        */
+
+        await updateCustomerMemory({
+
+            conversation,
+
+            visitor,
+
+            userMessage:
+                message,
+
+            assistantMessage:
+                completion.content
+
+        });
+
+        /*
+        |--------------------------------------------------------------------------
+        | AI Request Logging
+        |--------------------------------------------------------------------------
+        */
+
+        logAIRequest({
+
+            shopId:
+                shop._id,
+
+            conversationId:
+                conversation._id,
+
+            visitorId:
+                visitor?._id,
+
+            model:
+                completion.model,
+
+            usage:
+                completion.usage,
+
+            cost: {
+
+                inputCost:
+                    performance.inputCost,
+
+                outputCost:
+                    performance.outputCost,
+
+                totalCost:
+                    performance.totalCost
+
+            },
+
+            responseTime:
+                performance.responseTime
+
+        });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Return Final Response
+        |--------------------------------------------------------------------------
+        */
+
+        return formatResponse({
+
+            success: true,
+
+            content:
+                completion.content,
+
+            model:
+                completion.model,
+
+            provider:
+                "openai",
+
+            finishReason:
+                completion.finishReason,
+
+            usage:
+                completion.usage,
+
+            recommendations:
+                productCards,
+
+            actions,
+
+            quickReplies,
+
+            metadata
+
+        });
+
+    } catch (error) {
+
+        console.error(
+
+            "AI Chat Error:",
+
+            error
+
+        );
+
+        return buildErrorResponse(
+
+            error
+
+        );
+
+    }
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Streaming Chat Response
+|--------------------------------------------------------------------------
+*/
+
+export async function streamChatResponse({
+
+    shop,
+
+    visitor,
+
+    conversation,
+
+    message,
+
+    plan,
+
+    messages,
+
+    intent,
+
+    memory,
+
+    recommendations,
+
+    startedAt
+
+}) {
+
+    try {
+
+        /*
+        |--------------------------------------------------------------------------
+        | OpenAI Streaming Request
+        |--------------------------------------------------------------------------
+        */
+
+        const streamResponse =
+            await OpenAIService.streamResponse({
+
+                plan,
+
+                input:
+                    messages,
+
+                systemPrompt:
+                    messages
+                        .find(
+                            item =>
+                                item.role === "system"
+                        )
+                        ?.content || "",
+
+                temperature:
+                    AI_CONFIG.TEMPERATURE,
+
+                maxTokens:
+                    getTokenLimit(plan),
+
+                metadata: {
+
+                    shopId:
+                        String(shop._id),
+
+                    conversationId:
+                        String(
+                            conversation._id
+                        ),
+
+                    visitorId:
+                        visitor?._id
+                            ? String(
+                                visitor._id
+                            )
+                            : ""
+
+                }
+
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Return Stream
+        |--------------------------------------------------------------------------
+        |
+        | The controller / route layer is responsible for
+        | sending the stream to the client.
+        |--------------------------------------------------------------------------
+        */
+
+        return {
+
+            success: true,
+
+            streaming: true,
+
+            stream:
+                streamResponse,
+
+            metadata: {
+
+                plan,
+
+                intent:
+                    intent.intent ||
+                    "unknown",
+
+                recommendations:
+                    buildProductCards(
+                        recommendations
+                    ),
+
+                quickReplies:
+                    buildQuickReplies(
+                        intent.intent
+                    ),
+
+                actions:
+                    buildActions(
+                        recommendations
+                    ),
+
+                startedAt
+
+            }
+
+        };
+
+    } catch (error) {
+
+        console.error(
+
+            "AI Streaming Error:",
+
+            error
+
+        );
+
+        throw error;
+
+    }
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Generate Reply
+|--------------------------------------------------------------------------
+*/
+
+export async function generateReply(
+
+    data
+
+) {
+
+    return chat({
+
+        ...data,
+
+        stream: false
+
+    });
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Generate Streaming Reply
+|--------------------------------------------------------------------------
+*/
+
+export async function generateStreamingReply(
+
+    data
+
+) {
+
+    return chat({
+
+        ...data,
+
+        stream: true
+
+    });
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Detect Customer Intent
+|--------------------------------------------------------------------------
+*/
+
+export async function detectCustomerIntent({
+
+    conversation,
+
+    message
+
+}) {
+
+    return analyzeCustomerIntent({
+
+        conversation,
+
+        message
+
+    });
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Build Conversation Memory
+|--------------------------------------------------------------------------
+*/
+
+export async function buildConversationMemory(
+
+    conversation
+
+) {
+
+    return buildMemoryContext(
+
+        conversation
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Recommend Products
+|--------------------------------------------------------------------------
+*/
+
+export async function recommendProducts({
+
+    conversation,
+
+    shop,
+
+    currentProduct = null,
+
+    cartItems = []
+
+}) {
+
+    return generateRecommendations({
+
+        conversation,
+
+        shop,
+
+        currentProduct,
+
+        cartItems
+
+    });
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Generate Product Cards
+|--------------------------------------------------------------------------
+*/
+
+export function createProductCards(
+
+    products = []
+
+) {
+
+    return buildProductCards(
+
+        products
+
+    );
+
+}
+ /*
+|--------------------------------------------------------------------------
+| Public API — Build Quick Replies
+|--------------------------------------------------------------------------
+*/
+
+export function createQuickReplies(
+
+    intent
+
+) {
+
+    return buildQuickReplies(
+
+        intent
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Build Actions
+|--------------------------------------------------------------------------
+*/
+
+export function createActions(
+
+    products = []
+
+) {
+
+    return buildActions(
+
+        products
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Build Cart Recovery
+|--------------------------------------------------------------------------
+*/
+
+export function createCartRecovery(
+
+    cart = {}
+
+) {
+
+    return buildCartRecovery(
+
+        cart
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Build Upsell Response
+|--------------------------------------------------------------------------
+*/
+
+export function createUpsellResponse(
+
+    products = []
+
+) {
+
+    return buildUpsellResponse(
+
+        products
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Build Cross-Sell Response
+|--------------------------------------------------------------------------
+*/
+
+export function createCrossSellResponse(
+
+    products = []
+
+) {
+
+    return buildCrossSellResponse(
+
+        products
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Format Response
+|--------------------------------------------------------------------------
+*/
+
+export function createFormattedResponse(
+
+    result = {}
+
+) {
+
+    return formatResponse(
+
+        result
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Public API — Error Response
+|--------------------------------------------------------------------------
+*/
+
+export function createErrorResponse(
+
+    error
+
+) {
+
+    return buildErrorResponse(
+
+        error
+
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Final AI Service Object
+|--------------------------------------------------------------------------
+*/
+
+export const AIService = {
+
+    /*
+    | Core Chat
+    */
+
+    chat,
+
+    generateReply,
+
+    generateStreamingReply,
+
+    /*
+    | Context
+    */
+
+    loadConversation,
+
+    loadVisitor,
+
+    loadProducts,
+
+    buildAIContext,
+
+    buildMemoryContext,
+
+    buildProductContext,
+
+    /*
+    | Intent
+    */
+
+    analyzeCustomerIntent,
+
+    detectCustomerIntent,
+
+    /*
+    | Recommendations
+    */
+
+    generateRecommendations,
+
+    recommendProducts,
+
+    /*
+    | Prompt
+    */
+
+    buildPrompt,
+
+    /*
+    | Conversation
+    */
+
+    loadConversationHistory,
+
+    buildConversationMemory,
+
+    /*
+    | OpenAI
+    */
+
+    generateChatCompletion,
+
+    requestAI,
+
+    executeWithRetry,
+
+    parseCompletion,
+
+    handleAIError,
+
+    /*
+    | Messages
+    */
+
+    saveAssistantMessage,
+
+    updateConversationAfterResponse,
+
+    updateConversationAnalytics,
+
+    updateCustomerMemory,
+
+    /*
+    | Response Builders
+    */
+
+    buildProductCards,
+
+    createProductCards,
+
+    buildQuickReplies,
+
+    createQuickReplies,
+
+    buildActions,
+
+    createActions,
+
+    buildCartRecovery,
+
+    createCartRecovery,
+
+    buildUpsellResponse,
+
+    createUpsellResponse,
+
+    buildCrossSellResponse,
+
+    createCrossSellResponse,
+
+    /*
+    | Formatting
+    */
+
+    formatResponse,
+
+    createFormattedResponse,
+
+    buildPerformanceMetrics,
+
+    calculateTokenUsage,
+
+    calculateCost,
+
+    logAIRequest,
+
+    /*
+    | Error Handling
+    */
+
+    buildErrorResponse,
+
+    createErrorResponse
+
+};
+
+
+/*
+|--------------------------------------------------------------------------
+| Default Export
+|--------------------------------------------------------------------------
+*/
+
+export default AIService;
